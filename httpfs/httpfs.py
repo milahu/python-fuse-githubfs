@@ -45,11 +45,13 @@ class LRUCache:
         self.cache = collections.OrderedDict()
 
     def __getitem__(self, key):
+        print("LRUCache.get: key = " + key)
         value = self.cache.pop(key)
         self.cache[key] = value
         return value
 
     def __setitem__(self, key, value):
+        print("LRUCache.set: key = " + key)
         try:
             self.cache.pop(key)
         except KeyError:
@@ -90,7 +92,7 @@ class FtpFetcher:
         ftp = self.login(server)
         size = ftp.size(path)
         ftp.close()
-        return size
+        return size, None
 
     def get_data(self, url, start, end):
         import time
@@ -136,26 +138,48 @@ class HttpFetcher:
             )
 
     def get_size(self, url):
+        print("HttpFetcher.get_size: url = " + url)
+        # TODO avoid try/except, use "if key in dict"
         try:
+            # TODO rename head to response
+            # TODO handle response.status_code
             head = requests.head(url, allow_redirects=True, verify=self.SSL_VERIFY)
-            return int(head.headers["Content-Length"])
-        except:
+            return int(head.headers["Content-Length"]), None
+        except KeyError:
+            # bad news: we must download the file to know its size
+            # TODO rename head to response
             head = requests.get(
                 url,
                 allow_redirects=True,
                 verify=self.SSL_VERIFY,
                 headers={"Range": "bytes=0-1"},
             )
-            crange = head.headers["Content-Range"]
-            match = re.search(r"/(\d+)$", crange)
-            if match:
-                return int(match.group(1))
+            if head.status_code != 200:
+                # not found
+                print("HttpFetcher.get_size: TODO verify: get.status_code = " + str(head.status_code))
+                self.logger.error(traceback.format_exc())
+                raise FuseOSError(ENOENT)
 
-            self.logger.error(traceback.format_exc())
-            raise FuseOSError(ENOENT)
+            self.logger.info("got status %s", head.status_code)
+            head.raise_for_status() # TODO ?
+            file_data = np.frombuffer(head.content, dtype=np.uint8)
+
+            file_size = file_data.size
+
+            # TODO better handle large files
+            # https://docs.python-requests.org/en/master/user/quickstart/#raw-response-content
+
+            print("HttpFetcher.get_size: file_size = " + str(file_size))
+
+            return file_size, file_data
+
+            # TODO ?
+            #self.logger.error(traceback.format_exc())
+            #raise FuseOSError(ENOENT)
 
     @retry(wait=wait_fixed(1) + wait_random(0, 2), stop=stop_after_attempt(2))
     def get_data(self, url, start, end):
+        print("HttpFetcher.get_data: url = " + url)
         headers = {"Range": "bytes={}-{}".format(start, end), "Accept-Encoding": ""}
         self.logger.info("getting %s %s %s", url, start, end)
         r = requests.get(url, headers=headers)
@@ -188,7 +212,7 @@ class S3Fetcher:
 
         response = self.client.head_object(Bucket=bucket, Key=key)
         size = response["ContentLength"]
-        return size
+        return size, None
 
     @retry(wait=wait_exponential(multiplier=1, min=4, max=10))
     def get_data(self, url, start, end):
@@ -226,6 +250,8 @@ class HttpFs(LoggingMixIn, Operations):
         self.total_requests = 0
         self.getting = set()
 
+        self.foreground = True
+
         if not self.logger:
             self.logger = logging.getLogger(__name__)
 
@@ -251,13 +277,38 @@ class HttpFs(LoggingMixIn, Operations):
         self.block_size = block_size
 
     def getSize(self, url):
+        print("HttpFs.getSize: url = " + url)
         try:
-            return self.fetcher.get_size(url)
+            #return self.fetcher.get_size(url)
+            print("HttpFs.getSize: call fetcher.get_size")
+            size, file_data = self.fetcher.get_size(url)
+            print("HttpFs.getSize: type(file_data) = " + repr(type(file_data)))
+            if type(file_data) == type(None): # file_data is None or numpy.ndarray
+                print("HttpFs.getSize: file_data is None -> size = " + repr(size))
+                return size
+
+            print("HttpFs.getSize: add file_data to cache")
+
+            # this loop is simpler than in in "def read"
+            last_fetched = -1
+            curr_start = 0
+            while curr_start < size:
+                block_num = curr_start // self.block_size
+                block_start = self.block_size * block_num
+                block_data = file_data[block_start:(block_start + self.block_size)]
+                cache_key = "{}.{}.{}".format(url, self.block_size, block_num)
+                self.lru_cache[cache_key] = block_data
+                self.disk_cache[cache_key] = block_data
+                curr_start += self.block_size
+
+            return size
+
         except Exception as ex:
             self.logger.exception(ex)
             raise
 
     def getattr(self, path, fh=None):
+        print("HttpFs.getattr: path = " + path)
         try:
             if path in self.lru_attrs:
                 return self.lru_attrs[path]
@@ -266,35 +317,43 @@ class HttpFs(LoggingMixIn, Operations):
                 self.lru_attrs[path] = dict(st_mode=(S_IFDIR | 0o555), st_nlink=2)
                 return self.lru_attrs[path]
 
-            if (
-                path[-2:] != ".."
-                and not path.endswith("..-journal")
-                and not path.endswith("..-wal")
+            if not (
+                path[-2:] == ".."
+                or path.endswith("..-journal")
+                or path.endswith("..-wal")
             ):
+                print(f"HttpFs.getattr: path {path} is directory")
                 return dict(st_mode=(S_IFDIR | 0o555), st_nlink=2)
 
             url = "{}:/{}".format(self.schema, path[:-2])
 
+            print(f"HttpFs.getattr: path {path} is file -> url {url}")
+
             # there's an exception for the -jounral files created by SQLite
-            if not path.endswith("..-journal") and not path.endswith("..-wal"):
-                size = self.getSize(url)
-            else:
+            # TODO check this earlier, so we dont check twice
+            if path.endswith("..-journal") or path.endswith("..-wal"):
                 size = 0
+            else:
+                print("getattr: call getSize, url = " + url)
+                size = self.getSize(url) # FIXME size is None
+                print("getattr: call getSize -> size = " + repr(size))
 
             # logging.info("head: {}".format(head.headers))
             # logging.info("status_code: {}".format(head.status_code))
             # print("url:", url, "head.url", head.url)
 
             if size is not None:
+                file_time = time()
                 self.lru_attrs[path] = dict(
-                    st_mode=(S_IFREG | 0o644),
+                    st_mode=(S_IFREG | 0o644), # regular file. TODO read only? (0o444)
                     st_nlink=1,
                     st_size=size,
-                    st_ctime=time(),
-                    st_mtime=time(),
-                    st_atime=time(),
+                    st_ctime=file_time,
+                    st_mtime=file_time,
+                    st_atime=file_time,
                 )
             else:
+                print("getattr: size is None -> type is directory")
                 self.lru_attrs[path] = dict(st_mode=(S_IFDIR | 0o555), st_nlink=2)
 
             return self.lru_attrs[path]
@@ -312,6 +371,7 @@ class HttpFs(LoggingMixIn, Operations):
         return 0
 
     def read(self, path, size, offset, fh):
+        print("HttpFs.read: path = " + path)
         t1 = time()
 
         self.logger.debug("read %s %s %s", path, offset, size)
@@ -354,7 +414,7 @@ class HttpFs(LoggingMixIn, Operations):
 
             while last_fetched < offset + size:
                 block_num = curr_start // self.block_size
-                block_start = self.block_size * (curr_start // self.block_size)
+                block_start = self.block_size * block_num
 
                 block_id = (url, block_num)
                 while block_id in self.getting:
@@ -365,7 +425,7 @@ class HttpFs(LoggingMixIn, Operations):
                 self.getting.remove(block_id)
 
                 data_start = (
-                    curr_start - (curr_start // self.block_size) * self.block_size
+                    curr_start - block_num * self.block_size
                 )
 
                 data_end = min(self.block_size, offset + size - block_start)
@@ -389,6 +449,7 @@ class HttpFs(LoggingMixIn, Operations):
         self.disk_cache.close()
 
     def get_block(self, url, block_num):
+        print("HttpFs.get_block: url = " + url)
         """
         Get a data block from a URL. Blocks are 256K bytes in size
 
@@ -399,16 +460,19 @@ class HttpFs(LoggingMixIn, Operations):
         block_num: int
             The # of the 256K'th block of this file
         """
+        print(f"HttpFs.get_block: url = {url}, block_num = {block_num}")
         cache_key = "{}.{}.{}".format(url, self.block_size, block_num)
         cache = self.disk_cache
 
         self.total_blocks += 1
 
         if cache_key in self.lru_cache:
+            print(f"HttpFs.get_block: lru cache HIT @ url = {url}, block_num = {block_num}")
             self.lru_hits += 1
             hit = self.lru_cache[cache_key]
             return hit
         else:
+            print(f"HttpFs.get_block: lru cache MISS @ url = {url}, block_num = {block_num}")
             self.lru_misses += 1
 
             if cache_key in self.disk_cache:

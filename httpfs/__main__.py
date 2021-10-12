@@ -5,7 +5,7 @@ import sys
 
 from fuse import FUSE
 
-from .httpfs import HttpFs
+from __init__ import HttpFs
 
 
 def main():
@@ -105,6 +105,7 @@ Mounting HTTP Filesystem...
         args["mountpoint"],
         foreground=args["foreground"],
         allow_other=args["allow_other"],
+        debug=True,
     )
 
 
